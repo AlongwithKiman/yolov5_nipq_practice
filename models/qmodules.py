@@ -13,6 +13,8 @@ class Q_Conv(Conv):
         self.conv = Q_Conv2d(c1, c2, k, s, autopad(k, p), groups=g,
                              bias=False,
                              act_func='relu1' if c1 == 3 else 'swish')
+        
+        
         if c1 == 3 or c1 == 32:
             self.conv.a_quant._bitwidth.requires_grad = False
             self.conv.w_quant._bitwidth.requires_grad = False
@@ -48,25 +50,40 @@ class Q_Detect(Detect):
 # end of YOLOv5 quantized modules
 
 
+
 class Q_Conv2d(nn.Conv2d):
     def __init__(self, *args, act_func=None, **kwargs):
         super().__init__(*args, **kwargs)
         # TODO activation & weight quantizer
-
+        if(act_func is None):
+            symm = True
+        else:
+            symm = False
+        self.a_quant = Quantizer(act_func = act_func, symm = symm)
+        self.w_quant = Quantizer(act_func = act_func, symm = symm)
     def forward(self, x):
         # TODO quantize activation & weight
         # TODO forward pass using F.conv2d
+        x = F.conv2d(self.a_quant(x), (self.w_quant(self.weight)), self.bias,
+                self.stride, self.padding, self.dilation, self.groups)
         return x
+    
 
 
 class Q_Linear(nn.Linear):
     def __init__(self, *args, act_func=None, **kwargs):
         super().__init__(*args, **kwargs)
         # TODO activation & weight quantizer
-
+        if(act_func is None):
+            symm = True
+        else:
+            symm = False
+        self.a_quant = Quantizer(act_func = act_func, symm=symm)
+        self.w_quant = Quantizer(act_func = act_func, symm=symm)
     def forward(self, x):
         # TODO quantize activation & weight
         # TODO forward pass using F.linear
+        x = F.linear(self.a_quant(x), (self.w_quant(self.weight)), self.bias)
         return x
 
 
@@ -74,8 +91,17 @@ class noise_quant(Function):
     @staticmethod
     def forward(ctx, x, step):
         # TODO randomly sample random seed
-        ctx.save_for_backward(rseed)
-
+        if x.is_cuda:
+            rseed = torch.rand(1, device="cuda:0")[0]
+            ctx.save_for_backward(rseed)
+            torch.manual_seed(rseed)
+            t1 = x + torch.round(torch.randn(1, device="cuda:0")[0]/2) * step
+        else:
+            rseed = torch.rand(1, device="cpu")[0]
+            ctx.save_for_backward(rseed)
+            torch.manual_seed(rseed)
+            t1 = x + torch.round(torch.randn(1, device="cpu")[0]/2) * step
+        
         # TODO x + round(N(0, 1) / 2) * step
         # TODO try to reduce memory usage
 
@@ -84,8 +110,10 @@ class noise_quant(Function):
     @staticmethod
     def backward(ctx, grad_output):
         rseed = ctx.saved_tensors[0]
+        torch.manual_seed(rseed)
         # TODO construct same random values as forward
         # TODO get grad_step
+        grad_step = torch.round(torch.randn(1)[0]/2)
 
         return grad_output, grad_step
 
@@ -95,7 +123,9 @@ noise_quant = noise_quant.apply
 
 def hard_quant(x):
     # TODO implement STE
-    return x
+    y_out = x.round()
+    y_grad = x
+    return (y_out-y_grad).detach() + y_grad
 
 
 class Quantizer(nn.Module):
@@ -175,12 +205,18 @@ class Quantizer(nn.Module):
 
         step = alpha * n_lv_inv
         x = x + offset
+        
+        # step = step.to('cuda:0')
+        # x = x.to('cuda:0')
+        # n_lv = n_lv.to('cuda:0')
         if is_training and self._bitwidth.requires_grad:
             # TODO NIPQ
-            pass
+            x = torch.clamp((noise_quant(x, step))/alpha ,0 ,1) * alpha
+            
         else:
             # TODO LSQ
-            pass
+            x = hard_quant(torch.clamp(x/alpha, 0, 1)*n_lv) * step
+
         return x - offset
 
     def forward(self, x):
@@ -212,7 +248,10 @@ def bops(k, c_in, c_out, h_out, w_out, w_bit, a_bit):
     # (1 GiBitOPs = 2 ** 30 BitOPs) # beware of subnormal values
 
     # TODO calculate GiBitOPs assuming Conv2d layer
-    return
+    _bops = (c_out) * (c_in * k * k) * (w_out * h_out) * a_bit * w_bit
+    _gibops = _bops / (2 ** 30)
+
+    return _gibops
 
 
 def model_bops(model):
@@ -223,10 +262,19 @@ def model_bops(model):
         if isinstance(m, conv):
             # TODO complete input values for `bops`
             # NOTE refer `sample_activation_size`
-            pass
+            k = m.kernel_size[0]
+            c_in = m.in_channels 
+            c_out = m.out_channels
+            h_out = m.out_height
+            w_out = m.out_width
         elif isinstance(m, linear):
             # TODO complete input values for `bops`
             # NOTE FC layer is special case of Conv2d layer
+            k = 1
+            c_in = m.in_features 
+            c_out = 1
+            h_out = 1
+            w_out = m.out_features
             pass
         else:
             continue
